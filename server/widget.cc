@@ -2,7 +2,7 @@
 
 #include "os/abi.h"
 
-namespace window {
+namespace osgui::widgets {
 
 void Widget::init(const WidgetBounds& bounds) { bounds_ = bounds; }
 
@@ -16,8 +16,7 @@ bool Widget::contains(int32_t x, int32_t y) const {
            y < bounds_.y + static_cast<int32_t>(bounds_.height);
 }
 
-void Label::init(const WidgetBounds& bounds, const char* text,
-                       uint32_t color) {
+void Label::init(const WidgetBounds& bounds, const char* text, uint32_t color) {
     Widget::init(bounds);
     os::Runtime::copyString(text_, text, sizeof(text_));
     color_ = color;
@@ -64,11 +63,11 @@ void TextBox::render(WidgetCanvas& canvas) const {
                          focused_ ? 0x00ffffffU : 0x00edf0f2U);
     const uint32_t border = focused_ ? 0x002b8a65U : 0x00949ba3U;
     canvas.fillRectangle(bounds_.x, bounds_.y, bounds_.width, 2, border);
-    canvas.fillRectangle(bounds_.x, bounds_.y + bounds_.height - 2,
-                         bounds_.width, 2, border);
+    canvas.fillRectangle(bounds_.x, bounds_.y + bounds_.height - 2, bounds_.width, 2,
+                         border);
     canvas.fillRectangle(bounds_.x, bounds_.y, 2, bounds_.height, border);
-    canvas.fillRectangle(bounds_.x + bounds_.width - 2, bounds_.y, 2,
-                         bounds_.height, border);
+    canvas.fillRectangle(bounds_.x + bounds_.width - 2, bounds_.y, 2, bounds_.height,
+                         border);
     canvas.drawText(bounds_.x + 8, bounds_.y + 9, text_, 0x0021262cU);
 }
 
@@ -113,13 +112,13 @@ char TextBox::translate(os::KeyCode keyCode, uint32_t modifiers) const {
         const bool caps = (modifiers & os::keyModifierCapsLock) != 0;
         const char base = shift != caps ? 'A' : 'a';
         return static_cast<char>(base + static_cast<uint32_t>(keyCode) -
-                                            static_cast<uint32_t>(os::KeyCode::A));
+                                 static_cast<uint32_t>(os::KeyCode::A));
     }
     if (keyCode >= os::KeyCode::Digit1 && keyCode <= os::KeyCode::Digit9) {
         return static_cast<char>('1' + static_cast<uint32_t>(keyCode) -
-                                           static_cast<uint32_t>(os::KeyCode::Digit1));
+                                 static_cast<uint32_t>(os::KeyCode::Digit1));
     }
     return keyCode == os::KeyCode::Digit0 ? '0' : '\0';
 }
 
-}  // namespace window
+}  // namespace osgui::widgets

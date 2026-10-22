@@ -1,0 +1,59 @@
+{
+  "name": "guiw-editor",
+  "version": "0.2.0",
+  "targets": [
+    {
+      "name": "guiw-editor",
+      "sources": [
+        "*.cc"
+      ],
+      "libraries": [
+        "osgui-c++",
+        "c++",
+        "c",
+        "os-c++"
+      ]
+    }
+  ],
+  "install": {
+    "guiw-editor": "/usr/bin/guiw-editor"
+  },
+  "cppflags": [
+    "-nostdinc",
+    "-ffreestanding",
+    "-fno-builtin",
+    "-fno-stack-protector",
+    "-fPIC",
+    "-m64",
+    "-mcmodel=small",
+    "-mno-red-zone"
+  ],
+  "cflags": [
+    "-std=c17",
+    "-Os",
+    "-Wall",
+    "-Wextra"
+  ],
+  "cxxflags": [
+    "-std=c++20",
+    "-fno-exceptions",
+    "-fno-rtti",
+    "-fno-use-cxa-atexit",
+    "-fno-threadsafe-statics",
+    "-nostdinc++",
+    "-Os",
+    "-Wall",
+    "-Wextra"
+  ],
+  "ldflags": [
+    "-nostdlib",
+    "-nostartfiles",
+    "-nodefaultlibs",
+    "-Wl,--build-id=none,--hash-style=sysv",
+    "-Wl,--no-as-needed"
+  ],
+  "asflags": [],
+  "ldlibs": [
+    "gcc"
+  ]
+}

@@ -4,6 +4,11 @@
   "iso_template": "",
   "disk_image": "osinfo.img",
   "iso_image": "osinfo.iso",
+  "dependencies": [
+    "lib/osgui-c++/build/packages/libosgui-c++.inpk",
+    "app/tools/build/packages/guiw-app-tools.inpk",
+    "app/editor/build/packages/guiw-editor.inpk"
+  ],
   "qemu": "qemu-system-x86_64",
   "memory_mb": 512,
   "cpus": 4,

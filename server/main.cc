@@ -1,36 +1,36 @@
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+
+#include "batch.h"
+#include "damage.h"
 #include "os/abi.h"
-#include "os/task.h"
-#include "osgui/font.h"
-#include "osgui/gui.h"
 #include "os/input.h"
 #include "os/service.h"
 #include "os/sync.h"
+#include "os/task.h"
+#include "osgui/font.h"
+#include "osgui/gui.h"
+#include "pixels.h"
+#include "profile.h"
 #include "widget.h"
 
 namespace {
 
-constexpr uint32_t windowCapacity           = 8;
-constexpr uint32_t eventCapacity            = 32;
-constexpr uint32_t maximumSurfaceWidth      = 704;
-constexpr uint32_t maximumSurfaceHeight     = 448;
-constexpr uint32_t titleBarHeight           = 22;
-constexpr uint64_t framebufferAddress       = 0x0000000050000000ULL;
+constexpr uint32_t windowCapacity = 8;
+constexpr uint32_t eventCapacity = 32;
+constexpr uint32_t maximumSurfaceWidth = 704;
+constexpr uint32_t maximumSurfaceHeight = 448;
+constexpr uint32_t titleBarHeight = 22;
+constexpr uint64_t framebufferAddress = 0x0000000050000000ULL;
 constexpr uint64_t frameIntervalNanoseconds = 16666667ULL;
-constexpr uint64_t compositorStackAddress   = 0x0000000062000000ULL;
-constexpr uint64_t serviceThreadStackSize   = 64 * 1024;
+constexpr uint64_t compositorStackAddress = 0x0000000062000000ULL;
+constexpr uint64_t serviceThreadStackSize = 64 * 1024;
 
-uint32_t surfaceStorage[windowCapacity]
-                       [maximumSurfaceWidth * maximumSurfaceHeight];
-
-struct Rectangle {
-    int32_t x;
-    int32_t y;
-    int32_t width;
-    int32_t height;
-};
+using Rectangle = osgui::detail::Rect;
 
 class Geometry {
- public:
+   public:
     static bool intersects(const Rectangle& left, const Rectangle& right);
     static Rectangle intersection(const Rectangle& left, const Rectangle& right);
     static int32_t absolute(int32_t value);
@@ -42,16 +42,7 @@ bool Geometry::intersects(const Rectangle& left, const Rectangle& right) {
 }
 
 Rectangle Geometry::intersection(const Rectangle& left, const Rectangle& right) {
-    const int32_t x          = left.x > right.x ? left.x : right.x;
-    const int32_t y          = left.y > right.y ? left.y : right.y;
-    const int32_t rightEdge  = left.x + left.width < right.x + right.width
-                                   ? left.x + left.width
-                                   : right.x + right.width;
-    const int32_t bottomEdge = left.y + left.height < right.y + right.height
-                                   ? left.y + left.height
-                                   : right.y + right.height;
-    return {x, y, rightEdge > x ? rightEdge - x : 0,
-            bottomEdge > y ? bottomEdge - y : 0};
+    return osgui::detail::intersect(left, right);
 }
 
 int32_t Geometry::absolute(int32_t value) { return value < 0 ? -value : value; }
@@ -59,122 +50,160 @@ int32_t Geometry::absolute(int32_t value) { return value < 0 ? -value : value; }
 class DisplayDriver {
    public:
     bool init() {
-        return os::Device::mapFramebuffer(framebufferAddress, info_) == 0 &&
-               info_.address != 0 && info_.width != 0 && info_.height != 0 &&
-               (info_.bitsPerPixel == 24 || info_.bitsPerPixel == 32);
+        if (os::Device::mapFramebuffer(framebufferAddress, info_) || !info_.address ||
+            !info_.width || !info_.height || info_.width > 4096 ||
+            info_.height > 2160 ||
+            (info_.bitsPerPixel != 24 && info_.bitsPerPixel != 32) ||
+            uint64_t(info_.width) * (info_.bitsPerPixel / 8) > info_.pitch ||
+            info_.redPosition > info_.bitsPerPixel - 8 ||
+            info_.greenPosition > info_.bitsPerPixel - 8 ||
+            info_.bluePosition > info_.bitsPerPixel - 8)
+            return false;
+        const uint32_t red = 255U << info_.redPosition,
+                       green = 255U << info_.greenPosition,
+                       blue = 255U << info_.bluePosition;
+        if ((red & green) || (red & blue) || (green & blue)) return false;
+        pixels_ =
+            static_cast<uint32_t*>(calloc(uint64_t(info_.width) * info_.height, 4));
+        return pixels_ != nullptr;
     }
-
     const os::DisplayInfo& info() const { return info_; }
-
     void drawPixel(int32_t x, int32_t y, uint32_t color) {
-        if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= info_.width ||
-            static_cast<uint32_t>(y) >= info_.height) {
-            return;
-        }
-        const uint8_t red   = static_cast<uint8_t>(color >> 16);
-        const uint8_t green = static_cast<uint8_t>(color >> 8);
-        const uint8_t blue  = static_cast<uint8_t>(color);
-        uint32_t packed =
-            (static_cast<uint32_t>(red) << info_.redPosition) |
-            (static_cast<uint32_t>(green) << info_.greenPosition) |
-            (static_cast<uint32_t>(blue) << info_.bluePosition);
-        uint8_t* pixel = reinterpret_cast<uint8_t*>(info_.address) +
-                         static_cast<uint64_t>(y) * info_.pitch +
-                         static_cast<uint64_t>(x) * (info_.bitsPerPixel / 8);
-        pixel[0] = static_cast<uint8_t>(packed);
-        pixel[1] = static_cast<uint8_t>(packed >> 8);
-        pixel[2] = static_cast<uint8_t>(packed >> 16);
-        if (info_.bitsPerPixel == 32) {
-            pixel[3] = static_cast<uint8_t>(packed >> 24);
-        }
+        if (x >= 0 && y >= 0 && uint32_t(x) < info_.width && uint32_t(y) < info_.height)
+            pixels_[uint64_t(y) * info_.width + x] = color;
     }
-
     void fillRectangle(int32_t x, int32_t y, uint32_t width, uint32_t height,
                        uint32_t color) {
-        for (uint32_t row = 0; row < height; ++row) {
-            for (uint32_t column = 0; column < width; ++column) {
-                drawPixel(x + static_cast<int32_t>(column),
-                          y + static_cast<int32_t>(row), color);
+        const auto clipped =
+            Geometry::intersection({x, y, int32_t(width), int32_t(height)},
+                                   {0, 0, int32_t(info_.width), int32_t(info_.height)});
+        for (int32_t row = clipped.y; row < clipped.y + clipped.height; ++row) {
+            uint32_t* output = pixels_ + uint64_t(row) * info_.width + clipped.x;
+            for (int32_t column = 0; column < clipped.width; ++column)
+                output[column] = color;
+        }
+    }
+    void blendPixel(int32_t x, int32_t y, uint32_t color, uint32_t alpha) {
+        if (x < 0 || y < 0 || uint32_t(x) >= info_.width || uint32_t(y) >= info_.height)
+            return;
+        uint32_t& target = pixels_[uint64_t(y) * info_.width + x];
+        const uint32_t r = (((color >> 16) & 255) * alpha +
+                            ((target >> 16) & 255) * (255 - alpha) + 127) /
+                           255;
+        const uint32_t g = (((color >> 8) & 255) * alpha +
+                            ((target >> 8) & 255) * (255 - alpha) + 127) /
+                           255;
+        const uint32_t b =
+            ((color & 255) * alpha + (target & 255) * (255 - alpha) + 127) / 255;
+        target = (r << 16) | (g << 8) | b;
+    }
+    void copyRow(int32_t x, int32_t y, const uint32_t* source, uint32_t width) {
+        memcpy(pixels_ + uint64_t(y) * info_.width + x, source, width * 4);
+    }
+    void present(const Rectangle& rectangle) {
+        const uint32_t bytes = info_.bitsPerPixel / 8;
+        for (int32_t y = rectangle.y; y < rectangle.y + rectangle.height; ++y) {
+            const uint32_t* source = pixels_ + uint64_t(y) * info_.width + rectangle.x;
+            auto* target = reinterpret_cast<uint8_t*>(info_.address) +
+                           uint64_t(y) * info_.pitch + uint64_t(rectangle.x) * bytes;
+            if (bytes == 4 && info_.redPosition == 16 && info_.greenPosition == 8 &&
+                info_.bluePosition == 0) {
+                memcpy(target, source, rectangle.width * 4);
+            } else {
+                for (int32_t x = 0; x < rectangle.width; ++x, target += bytes) {
+                    const uint32_t color = source[x];
+                    const uint32_t packed =
+                        ((color >> 16) & 255U) << info_.redPosition |
+                        ((color >> 8) & 255U) << info_.greenPosition |
+                        (color & 255U) << info_.bluePosition;
+                    target[0] = packed;
+                    target[1] = packed >> 8;
+                    target[2] = packed >> 16;
+                    if (bytes == 4) target[3] = packed >> 24;
+                }
             }
         }
     }
 
    private:
     os::DisplayInfo info_{};
+    uint32_t* pixels_ = nullptr;
 };
 
-class Surface : public window::WidgetCanvas {
+class Surface : public osgui::widgets::WidgetCanvas {
    public:
-    void init(uint32_t* pixels) { pixels_ = pixels; }
-
     bool resize(uint32_t width, uint32_t height) {
-        if (pixels_ == nullptr || width == 0 || height == 0 ||
-            width > maximumSurfaceWidth || height > maximumSurfaceHeight) {
-            return false;
+        return pixels_.resize(width, height);
+    }
+    uint32_t width() const { return pixels_.width(); }
+    uint32_t height() const { return pixels_.height(); }
+    uint32_t pixel(uint32_t x, uint32_t y) const {
+        return pixels_.data()[y * width() + x];
+    }
+    const uint32_t* row(uint32_t y) const { return pixels_.data() + y * width(); }
+    void drawPixel(int32_t x, int32_t y, uint32_t color) {
+        if (x >= 0 && y >= 0 && uint32_t(x) < width() && uint32_t(y) < height() &&
+            pixels_.writable())
+            pixels_.mutableData()[uint32_t(y) * width() + x] = color;
+    }
+    void fillRectangle(int32_t x, int32_t y, uint32_t w, uint32_t h,
+                       uint32_t color) override {
+        const auto clipped =
+            Geometry::intersection({x, y, int32_t(w), int32_t(h)},
+                                   {0, 0, int32_t(width()), int32_t(height())});
+        if (!clipped.width || !clipped.height || !pixels_.writable()) return;
+        for (int32_t row = clipped.y; row < clipped.y + clipped.height; ++row) {
+            uint32_t* output =
+                pixels_.mutableData() + uint32_t(row) * width() + clipped.x;
+            for (int32_t column = 0; column < clipped.width; ++column)
+                output[column] = color;
         }
-        width_  = width;
-        height_ = height;
-        stride_ = maximumSurfaceWidth;
-        for (uint32_t row = 0; row < height_; ++row) {
-            for (uint32_t column = 0; column < width_; ++column) {
-                pixels_[row * stride_ + column] = 0xfff4f4f4U;
+    }
+
+    bool prepare() { return pixels_.writable(); }
+    void blend(int32_t x, int32_t y, const osgui::TextBitmap& bitmap, uint32_t color) {
+        if (!pixels_.writable()) return;
+        for (uint32_t row = 0; row < bitmap.height; ++row)
+            for (uint32_t column = 0; column < bitmap.width; ++column) {
+                const int64_t px = int64_t(x) + column, py = int64_t(y) + row;
+                if (px < 0 || py < 0 || px >= width() || py >= height()) continue;
+                const uint32_t alpha = bitmap.pixels[row * bitmap.width + column];
+                uint32_t& target =
+                    pixels_.mutableData()[uint32_t(py) * width() + uint32_t(px)];
+                const uint32_t r = (((color >> 16) & 255) * alpha +
+                                    ((target >> 16) & 255) * (255 - alpha) + 127) /
+                                   255;
+                const uint32_t g = (((color >> 8) & 255) * alpha +
+                                    ((target >> 8) & 255) * (255 - alpha) + 127) /
+                                   255;
+                const uint32_t b =
+                    ((color & 255) * alpha + (target & 255) * (255 - alpha) + 127) /
+                    255;
+                target = (r << 16) | (g << 8) | b;
             }
-        }
+    }
+    void drawText(int32_t x, int32_t y, const char* text, uint32_t color) override {
+        osgui::TextBitmap bitmap;
+        if (text &&
+            osgui::Font::render(text, strlen(text), osgui::FontFace::Ui, 16, bitmap))
+            blend(x, y, bitmap, color);
+    }
+    bool mask(const osgui::TextBitmap& bitmap) {
+        if (!resize(bitmap.width ? bitmap.width : 1, bitmap.height ? bitmap.height : 1))
+            return false;
+        for (uint32_t y = 0; y < bitmap.height; ++y)
+            for (uint32_t x = 0; x < bitmap.width; ++x)
+                pixels_.mutableData()[y * width() + x] =
+                    bitmap.pixels[y * bitmap.width + x];
         return true;
     }
 
-    uint32_t width() const { return width_; }
-    uint32_t height() const { return height_; }
-
-    void drawPixel(int32_t x, int32_t y, uint32_t color) {
-        if (x >= 0 && y >= 0 && static_cast<uint32_t>(x) < width_ &&
-            static_cast<uint32_t>(y) < height_) {
-            pixels_[static_cast<uint32_t>(y) * stride_ +
-                    static_cast<uint32_t>(x)] = color;
-        }
-    }
-
-    uint32_t pixel(uint32_t x, uint32_t y) const {
-        return pixels_[y * stride_ + x];
-    }
-
-    void fillRectangle(int32_t x, int32_t y, uint32_t width, uint32_t height,
-                       uint32_t color) override {
-        for (uint32_t row = 0; row < height; ++row) {
-            for (uint32_t column = 0; column < width; ++column) {
-                drawPixel(x + static_cast<int32_t>(column),
-                          y + static_cast<int32_t>(row), color);
-            }
-        }
-    }
-
-    void drawText(int32_t x, int32_t y, const char* text,
-                  uint32_t color) override {
-        for (uint32_t character = 0; text != nullptr && text[character] != '\0';
-             ++character) {
-            const uint8_t glyph = static_cast<uint8_t>(text[character]);
-            for (uint32_t row = 0; row < os::consoleFontHeight; ++row) {
-                const uint8_t bits = os::consoleFont[glyph][row];
-                for (uint32_t column = 0; column < os::consoleFontWidth;
-                     ++column) {
-                    if ((bits & (0x80U >> column)) != 0) {
-                        drawPixel(
-                            x + static_cast<int32_t>(
-                                    character * os::consoleFontWidth + column),
-                            y + static_cast<int32_t>(row), color);
-                    }
-                }
-            }
-        }
-    }
-
-    void drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
-                  uint32_t color) {
+    void drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t color) {
         const int32_t deltaX = Geometry::absolute(x1 - x0);
-        const int32_t stepX  = x0 < x1 ? 1 : -1;
+        const int32_t stepX = x0 < x1 ? 1 : -1;
         const int32_t deltaY = -Geometry::absolute(y1 - y0);
-        const int32_t stepY  = y0 < y1 ? 1 : -1;
-        int32_t error        = deltaX + deltaY;
+        const int32_t stepY = y0 < y1 ? 1 : -1;
+        int32_t error = deltaX + deltaY;
         while (true) {
             drawPixel(x0, y0, color);
             if (x0 == x1 && y0 == y1) {
@@ -193,10 +222,7 @@ class Surface : public window::WidgetCanvas {
     }
 
    private:
-    uint32_t width_   = 0;
-    uint32_t height_  = 0;
-    uint32_t stride_  = 0;
-    uint32_t* pixels_ = nullptr;
+    osgui::detail::Pixels pixels_;
 };
 
 class EventQueue {
@@ -204,15 +230,15 @@ class EventQueue {
     void clear() { count_ = 0; }
     bool empty() const { return count_ == 0; }
 
-    bool push(const os::WindowEvent& event) {
-        if (count_ != 0 && event.type == os::WindowEventType::MouseMove &&
-            events_[count_ - 1].type == os::WindowEventType::MouseMove) {
+    bool push(const osgui::WindowEvent& event) {
+        if (count_ != 0 && event.type == osgui::WindowEventType::MouseMove &&
+            events_[count_ - 1].type == osgui::WindowEventType::MouseMove) {
             events_[count_ - 1] = event;
             return true;
         }
         if (count_ == eventCapacity) {
-            if (event.type == os::WindowEventType::MouseMove &&
-                events_[count_ - 1].type == os::WindowEventType::MouseMove) {
+            if (event.type == osgui::WindowEventType::MouseMove &&
+                events_[count_ - 1].type == osgui::WindowEventType::MouseMove) {
                 events_[count_ - 1] = event;
                 return true;
             }
@@ -222,7 +248,7 @@ class EventQueue {
         return true;
     }
 
-    bool pop(os::WindowEvent& event) {
+    bool pop(osgui::WindowEvent& event) {
         if (count_ == 0) {
             return false;
         }
@@ -235,7 +261,7 @@ class EventQueue {
     }
 
    private:
-    os::WindowEvent events_[eventCapacity]{};
+    osgui::WindowEvent events_[eventCapacity]{};
     uint32_t count_ = 0;
 };
 
@@ -246,10 +272,14 @@ struct Window {
     int32_t y;
     bool active;
     bool visible;
-    os::WindowLayer layer;
+    bool movable = true;
+    osgui::WindowLayer layer;
     uint64_t zOrder;
     char title[48];
     Surface surface;
+    Surface committed;
+    Surface titleMask;
+    osgui::detail::Damage pendingDamage;
     EventQueue events;
     uint64_t eventEndpoint;
     bool eventWaiting;
@@ -261,22 +291,20 @@ class GraphicsServer {
 
     DisplayDriver& display() { return display_; }
 
-    void compose(Window* windows, uint32_t count, int32_t cursorX,
-                 int32_t cursorY, uint64_t focusedWindow,
-                 const Rectangle& dirty) {
-        const Rectangle screen  = {0, 0,
-                                   static_cast<int32_t>(display_.info().width),
-                                   static_cast<int32_t>(display_.info().height)};
+    void compose(Window* windows, uint32_t count, int32_t cursorX, int32_t cursorY,
+                 uint64_t focusedWindow, const Rectangle& dirty) {
+        const Rectangle screen = {0, 0, static_cast<int32_t>(display_.info().width),
+                                  static_cast<int32_t>(display_.info().height)};
         const Rectangle clipped = Geometry::intersection(dirty, screen);
         if (clipped.width == 0 || clipped.height == 0) {
             return;
         }
-        display_.fillRectangle(
-            clipped.x, clipped.y, static_cast<uint32_t>(clipped.width),
-            static_cast<uint32_t>(clipped.height), 0x00272a30U);
+        display_.fillRectangle(clipped.x, clipped.y,
+                               static_cast<uint32_t>(clipped.width),
+                               static_cast<uint32_t>(clipped.height), 0x00272a30U);
         uint64_t previousKey = 0;
         for (uint32_t drawn = 0; drawn < count; ++drawn) {
-            Window* next     = nullptr;
+            Window* next = nullptr;
             uint64_t nextKey = ~0ULL;
             for (uint32_t index = 0; index < count; ++index) {
                 Window& candidate = windows[index];
@@ -284,10 +312,9 @@ class GraphicsServer {
                     continue;
                 }
                 const uint64_t key =
-                    (static_cast<uint64_t>(candidate.layer) << 56) |
-                    candidate.zOrder;
+                    (static_cast<uint64_t>(candidate.layer) << 56) | candidate.zOrder;
                 if (key >= previousKey && key < nextKey) {
-                    next    = &candidate;
+                    next = &candidate;
                     nextKey = key;
                 }
             }
@@ -298,37 +325,11 @@ class GraphicsServer {
             previousKey = nextKey + 1;
         }
         drawCursor(cursorX, cursorY, clipped);
+        display_.present(clipped);
     }
 
    private:
-    static uint8_t glyphRow(char character, uint32_t row) {
-        struct Glyph {
-            char character;
-            uint8_t rows[7];
-        };
-        constexpr Glyph glyphs[] = {{'O', {14, 17, 17, 17, 17, 17, 14}},
-                                    {'S', {15, 16, 16, 14, 1, 1, 30}},
-                                    {'I', {31, 4, 4, 4, 4, 4, 31}},
-                                    {'N', {17, 25, 21, 19, 17, 17, 17}},
-                                    {'F', {31, 16, 16, 30, 16, 16, 16}},
-                                    {'W', {17, 17, 17, 21, 21, 21, 10}},
-                                    {'D', {30, 17, 17, 17, 17, 17, 30}},
-                                    {'E', {31, 16, 16, 30, 16, 16, 31}},
-                                    {'M', {17, 27, 21, 21, 17, 17, 17}},
-                                    {' ', {0, 0, 0, 0, 0, 0, 0}}};
-        if (character >= 'a' && character <= 'z') {
-            character = static_cast<char>(character - 'a' + 'A');
-        }
-        for (const Glyph& glyph : glyphs) {
-            if (glyph.character == character) {
-                return glyph.rows[row];
-            }
-        }
-        return row == 0 || row == 6 ? 31 : 17;
-    }
-
-    void drawWindow(const Window& window, const Rectangle& dirty,
-                    bool focused) {
+    void drawWindow(const Window& window, const Rectangle& dirty, bool focused) {
         const Rectangle frame = {
             window.x - 2, window.y - static_cast<int32_t>(titleBarHeight) - 2,
             static_cast<int32_t>(window.surface.width()) + 4,
@@ -337,59 +338,53 @@ class GraphicsServer {
             return;
         }
         fillClipped(frame, dirty, focused ? 0x003aa675U : 0x006a7079U);
-        const Rectangle title = {
-            window.x, window.y - static_cast<int32_t>(titleBarHeight),
-            static_cast<int32_t>(window.surface.width()),
-            static_cast<int32_t>(titleBarHeight)};
+        const Rectangle title = {window.x,
+                                 window.y - static_cast<int32_t>(titleBarHeight),
+                                 static_cast<int32_t>(window.surface.width()),
+                                 static_cast<int32_t>(titleBarHeight)};
         fillClipped(title, dirty, focused ? 0x001c704dU : 0x00464b52U);
-        drawTitle(window.title, window.x + 7,
-                  window.y - static_cast<int32_t>(titleBarHeight) + 7,
-                  0x00ffffffU, dirty);
-        const Rectangle content = {
-            window.x, window.y, static_cast<int32_t>(window.surface.width()),
-            static_cast<int32_t>(window.surface.height())};
-        const Rectangle pixels = Geometry::intersection(content, dirty);
-        for (int32_t y = pixels.y; y < pixels.y + pixels.height; ++y) {
-            for (int32_t x = pixels.x; x < pixels.x + pixels.width; ++x) {
-                display_.drawPixel(
-                    x, y,
-                    window.surface.pixel(static_cast<uint32_t>(x - window.x),
-                                         static_cast<uint32_t>(y - window.y)));
+        drawTitle(window.titleMask, window.x + 7,
+                  window.y - static_cast<int32_t>(titleBarHeight) + 2, 0x00ffffffU,
+                  Geometry::intersection(dirty, title));
+        if (window.surface.width() >= 24) {
+            const int32_t x = window.x + int32_t(window.surface.width()) - 15;
+            const int32_t y = window.y - int32_t(titleBarHeight) + 7;
+            for (int32_t i = 0; i < 8; ++i) {
+                fillClipped({x + i, y + i, 1, 1}, dirty, 0xffffff);
+                fillClipped({x + 7 - i, y + i, 1, 1}, dirty, 0xffffff);
             }
         }
+        const Rectangle content = {window.x, window.y,
+                                   static_cast<int32_t>(window.surface.width()),
+                                   static_cast<int32_t>(window.surface.height())};
+        const Rectangle pixels = Geometry::intersection(content, dirty);
+        for (int32_t y = pixels.y; y < pixels.y + pixels.height; ++y)
+            display_.copyRow(
+                pixels.x, y,
+                window.surface.row(uint32_t(y - window.y)) + pixels.x - window.x,
+                pixels.width);
     }
 
     void fillClipped(const Rectangle& rectangle, const Rectangle& dirty,
                      uint32_t color) {
         const Rectangle clipped = Geometry::intersection(rectangle, dirty);
         if (clipped.width > 0 && clipped.height > 0) {
-            display_.fillRectangle(
-                clipped.x, clipped.y, static_cast<uint32_t>(clipped.width),
-                static_cast<uint32_t>(clipped.height), color);
+            display_.fillRectangle(clipped.x, clipped.y,
+                                   static_cast<uint32_t>(clipped.width),
+                                   static_cast<uint32_t>(clipped.height), color);
         }
     }
 
-    void drawTitle(const char* title, int32_t x, int32_t y, uint32_t color,
+    void drawTitle(const Surface& mask, int32_t x, int32_t y, uint32_t color,
                    const Rectangle& dirty) {
-        for (uint32_t character = 0; title[character] != '\0' && character < 20;
-             ++character) {
-            for (uint32_t row = 0; row < 7; ++row) {
-                const uint8_t bits = glyphRow(title[character], row);
-                for (uint32_t column = 0; column < 5; ++column) {
-                    if ((bits & (1U << (4 - column))) != 0) {
-                        const int32_t pixelX =
-                            x + static_cast<int32_t>(character * 6 + column);
-                        const int32_t pixelY = y + static_cast<int32_t>(row);
-                        if (pixelX >= dirty.x &&
-                            pixelX < dirty.x + dirty.width &&
-                            pixelY >= dirty.y &&
-                            pixelY < dirty.y + dirty.height) {
-                            display_.drawPixel(pixelX, pixelY, color);
-                        }
-                    }
-                }
+        const Rectangle clipped = Geometry::intersection(
+            {x, y, int32_t(mask.width()), int32_t(mask.height())}, dirty);
+        for (int32_t py = clipped.y; py < clipped.y + clipped.height; ++py)
+            for (int32_t px = clipped.x; px < clipped.x + clipped.width; ++px) {
+                const uint32_t alpha = mask.pixel(uint32_t(px - x), uint32_t(py - y));
+                // Titles are white; blend against their stable title-bar background.
+                display_.blendPixel(px, py, color, alpha);
             }
-        }
     }
 
     void drawCursor(int32_t x, int32_t y, const Rectangle& dirty) {
@@ -398,8 +393,8 @@ class GraphicsServer {
                 y >= dirty.y && y < dirty.y + dirty.height) {
                 display_.drawPixel(x + offset, y, 0x00ffffffU);
             }
-            if (x >= dirty.x && x < dirty.x + dirty.width &&
-                y + offset >= dirty.y && y + offset < dirty.y + dirty.height) {
+            if (x >= dirty.x && x < dirty.x + dirty.width && y + offset >= dirty.y &&
+                y + offset < dirty.y + dirty.height) {
                 display_.drawPixel(x, y + offset, 0x00ffffffU);
             }
         }
@@ -415,12 +410,11 @@ class GraphicsServer {
 class WindowServer {
    public:
     bool init() {
-        if (!graphics_.init()) {
+        if (!osgui::Font::initialize() || !graphics_.init()) {
             return false;
         }
-        for (uint32_t index = 0; index < windowCapacity; ++index) {
-            windows_[index].surface.init(surfaceStorage[index]);
-        }
+        damageEndpoint_ = os::Endpoint::create();
+        if (!damageEndpoint_) return false;
         cursorX_ = static_cast<int32_t>(graphics_.display().info().width / 2);
         cursorY_ = static_cast<int32_t>(graphics_.display().info().height / 2);
         initializeDesktopLocked();
@@ -428,27 +422,168 @@ class WindowServer {
     }
 
     void handle(const os::IpcMessage& request, os::IpcMessage& reply) {
-        const auto operation = static_cast<os::WindowRequest>(request.type);
-        if (operation != os::WindowRequest::SubscribeEvents && request.handleCount) {
-            for (uint32_t i = 0; i < request.handleCount; ++i) os::closeHandle(request.handles[i]);
-            reply.data[0] = 1; reply.length = 1; return;
+        profile_.request();
+        const auto operation = static_cast<osgui::WindowRequest>(request.type);
+        if (request.length > os::ipcDataWordCount || request.handleCount > 4) {
+            reply.data[0] = 1;
+            reply.length = 1;
+            return;
         }
-        if (operation == os::WindowRequest::GetEvent) {
+        if (operation != osgui::WindowRequest::SubscribeEvents && request.handleCount) {
+            for (uint32_t i = 0; i < request.handleCount; ++i)
+                os::closeHandle(request.handles[i]);
+            reply.data[0] = 1;
+            reply.length = 1;
+            return;
+        }
+        if (operation == osgui::WindowRequest::Negotiate) {
+            reply.length = 3;
+            reply.data[0] =
+                request.length != 1 || request.data[0] != osgui::protocolVersion;
+            reply.data[1] = osgui::protocolVersion;
+            reply.data[2] = osgui::capabilityBatch | osgui::capabilityClipboard;
+            return;
+        }
+        if (operation == osgui::WindowRequest::DrawBatch) {
+            handleBatch(request, reply);
+            return;
+        }
+        if (operation == osgui::WindowRequest::ClipboardSet ||
+            operation == osgui::WindowRequest::ClipboardGet) {
+            std::lock_guard<std::mutex> guard(lock_);
+            reply.length = 1;
+            reply.data[0] = 1;
+            if (request.length < 1 || request.data[0] != osgui::protocolVersion) return;
+            if (operation == osgui::WindowRequest::ClipboardSet) {
+                const uint64_t length = request.data[1];
+                if (length > osgui::clipboardCapacity ||
+                    request.length != 2 + (length + 7) / 8 ||
+                    !osgui::utf8::valid(reinterpret_cast<const char*>(&request.data[2]),
+                                        length))
+                    return;
+                memcpy(clipboard_, &request.data[2], length);
+                clipboardLength_ = length;
+            } else {
+                reply.data[1] = clipboardLength_;
+                memcpy(&reply.data[2], clipboard_, clipboardLength_);
+                reply.length = 2 + (clipboardLength_ + 7) / 8;
+            }
+            reply.data[0] = 0;
+            return;
+        }
+        uint32_t required = 1;
+        switch (operation) {
+            case osgui::WindowRequest::Create:
+                required = 8;
+                break;
+            case osgui::WindowRequest::Resize:
+            case osgui::WindowRequest::Move:
+                required = 3;
+                break;
+            case osgui::WindowRequest::DrawPixel:
+                required = 4;
+                break;
+            case osgui::WindowRequest::DrawLine:
+            case osgui::WindowRequest::FillRectangle:
+                required = 6;
+                break;
+            case osgui::WindowRequest::DrawText:
+                required = 10;
+                break;
+            case osgui::WindowRequest::SetLayer:
+            case osgui::WindowRequest::SetMovable:
+                required = 2;
+                break;
+            case osgui::WindowRequest::GetDisplayInfo:
+                required = 0;
+                break;
+            default:
+                break;
+        }
+        if (request.length < required) {
+            reply.data[0] = 1;
+            reply.length = 1;
+            return;
+        }
+        if ((operation == osgui::WindowRequest::Create ||
+             operation == osgui::WindowRequest::Resize) &&
+            (request.data[operation == osgui::WindowRequest::Create ? 0 : 1] >
+                 maximumSurfaceWidth ||
+             request.data[operation == osgui::WindowRequest::Create ? 1 : 2] >
+                 maximumSurfaceHeight)) {
+            reply.data[0] = 1;
+            reply.length = 1;
+            return;
+        }
+        if (operation == osgui::WindowRequest::DrawLine) {
+            for (unsigned i = 1; i <= 4; ++i)
+                if (int64_t(request.data[i]) < -4096 ||
+                    int64_t(request.data[i]) > 4096) {
+                    reply.data[0] = 1;
+                    reply.length = 1;
+                    return;
+                }
+        }
+        if (operation == osgui::WindowRequest::GetEvent) {
             getEvent(request.senderPid, request.data[0], reply);
             return;
         }
-        if (operation == os::WindowRequest::SubscribeEvents) {
+        if (operation == osgui::WindowRequest::SubscribeEvents) {
             subscribeEvents(request, reply);
             return;
         }
-        os::SpinLockGuard guard(lock_);
+        if (operation == osgui::WindowRequest::SetSessionActive) {
+            std::lock_guard<std::mutex> displayGuard(displayLock_);
+            std::lock_guard<std::mutex> guard(lock_);
+            os::TaskInfo caller{};
+            reply.length = 1;
+            reply.data[0] = 1;
+            if (os::Task::query(request.senderPid, caller) ||
+                caller.serviceRole != uint32_t(os::ServiceRole::Console))
+                return;
+            sessionActive_ = request.data[0] != 0;
+            capturedWindow_ = 0;
+            if (sessionActive_) {
+                markScreenDirtyLocked();
+                nextFrameTime_ = 0;
+            }
+            reply.data[0] = 0;
+            return;
+        }
+        osgui::TextBitmap preparedText;
+        Surface preparedTitle;
+        if (operation == osgui::WindowRequest::DrawText) {
+            const char* text = reinterpret_cast<const char*>(&request.data[4]);
+            size_t length = 0;
+            while (length < 48 && text[length]) ++length;
+            if (length == 48 || !osgui::Font::render(text, length, osgui::FontFace::Ui,
+                                                     16, preparedText)) {
+                reply.data[0] = 1;
+                reply.length = 1;
+                return;
+            }
+        }
+        if (operation == osgui::WindowRequest::Create) {
+            const char* text = reinterpret_cast<const char*>(&request.data[2]);
+            size_t length = 0;
+            while (length < 48 && text[length]) ++length;
+            if (length == 48 ||
+                !osgui::Font::render(text, length, osgui::FontFace::Ui, 16,
+                                     preparedText) ||
+                !preparedTitle.mask(preparedText)) {
+                reply.data[0] = 1;
+                reply.length = 1;
+                return;
+            }
+        }
+        std::lock_guard<std::mutex> guard(lock_);
         Window* window = findOwned(request.senderPid, request.data[0]);
-        reply.data[0]  = 0;
+        reply.data[0] = 0;
         switch (operation) {
-            case os::WindowRequest::Create:
-                create(request, reply);
+            case osgui::WindowRequest::Create:
+                create(request, reply, preparedTitle);
                 break;
-            case os::WindowRequest::Destroy:
+            case osgui::WindowRequest::Destroy:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
@@ -458,27 +593,40 @@ class WindowServer {
                         window->eventEndpoint = 0;
                     }
                     window->eventWaiting = false;
-                    window->active       = false;
-                    window->visible      = false;
+                    if (capturedWindow_ == window->handle) capturedWindow_ = 0;
+                    window->active = false;
+                    window->visible = false;
+                    window->surface = Surface{};
+                    window->committed = Surface{};
+                    window->titleMask = Surface{};
                     if (focusedWindow_ == window->handle) {
                         focusedWindow_ = 0;
                     }
                 }
                 break;
-            case os::WindowRequest::Show:
-            case os::WindowRequest::Hide:
+            case osgui::WindowRequest::Show:
+            case osgui::WindowRequest::Hide:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
                     markWindowDirtyLocked(*window);
-                    window->visible = operation == os::WindowRequest::Show;
+                    window->visible = operation == osgui::WindowRequest::Show;
+                    if (window->visible && !window->committed.width())
+                        window->committed = window->surface;
+                    if (!window->visible && capturedWindow_ == window->handle)
+                        capturedWindow_ = 0;
                     if (window->visible) {
                         setFocusLocked(*window);
                     }
                     markWindowDirtyLocked(*window);
+                    osgui::WindowEvent visibility{};
+                    visibility.type = osgui::WindowEventType::WindowVisibility;
+                    visibility.x = window->visible ? 1 : 0;
+                    window->events.push(visibility);
+                    notifyEventWaiterLocked(*window);
                 }
                 break;
-            case os::WindowRequest::Resize:
+            case osgui::WindowRequest::Resize:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
@@ -488,11 +636,11 @@ class WindowServer {
                             static_cast<uint32_t>(request.data[2]))) {
                         reply.data[0] = 1;
                     } else {
-                        os::WindowEvent event{};
-                        event.type      = os::WindowEventType::WindowResize;
+                        osgui::WindowEvent event{};
+                        event.type = osgui::WindowEventType::WindowResize;
                         event.timestamp = os::Clock::getMonotonicTime();
-                        event.x         = static_cast<int32_t>(request.data[1]);
-                        event.y         = static_cast<int32_t>(request.data[2]);
+                        event.x = static_cast<int32_t>(request.data[1]);
+                        event.y = static_cast<int32_t>(request.data[2]);
                         window->events.push(event);
                         notifyEventWaiterLocked(*window);
                         clampWindowLocked(*window);
@@ -500,7 +648,7 @@ class WindowServer {
                     }
                 }
                 break;
-            case os::WindowRequest::Move:
+            case osgui::WindowRequest::Move:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
@@ -511,27 +659,27 @@ class WindowServer {
                     markWindowDirtyLocked(*window);
                 }
                 break;
-            case os::WindowRequest::DrawPixel:
+            case osgui::WindowRequest::DrawPixel:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
-                    window->surface.drawPixel(
-                        static_cast<int32_t>(request.data[1]),
-                        static_cast<int32_t>(request.data[2]), request.data[3]);
+                    window->surface.drawPixel(static_cast<int32_t>(request.data[1]),
+                                              static_cast<int32_t>(request.data[2]),
+                                              request.data[3]);
                 }
                 break;
-            case os::WindowRequest::DrawLine:
+            case osgui::WindowRequest::DrawLine:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
-                    window->surface.drawLine(
-                        static_cast<int32_t>(request.data[1]),
-                        static_cast<int32_t>(request.data[2]),
-                        static_cast<int32_t>(request.data[3]),
-                        static_cast<int32_t>(request.data[4]), request.data[5]);
+                    window->surface.drawLine(static_cast<int32_t>(request.data[1]),
+                                             static_cast<int32_t>(request.data[2]),
+                                             static_cast<int32_t>(request.data[3]),
+                                             static_cast<int32_t>(request.data[4]),
+                                             request.data[5]);
                 }
                 break;
-            case os::WindowRequest::FillRectangle:
+            case osgui::WindowRequest::FillRectangle:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
@@ -539,29 +687,37 @@ class WindowServer {
                         static_cast<int32_t>(request.data[1]),
                         static_cast<int32_t>(request.data[2]),
                         static_cast<uint32_t>(request.data[3]),
-                        static_cast<uint32_t>(request.data[4]),
-                        request.data[5]);
+                        static_cast<uint32_t>(request.data[4]), request.data[5]);
                 }
                 break;
-            case os::WindowRequest::DrawText:
+            case osgui::WindowRequest::DrawText:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
-                    window->surface.drawText(
-                        static_cast<int32_t>(request.data[1]),
-                        static_cast<int32_t>(request.data[2]),
-                        reinterpret_cast<const char*>(&request.data[4]),
-                        static_cast<uint32_t>(request.data[3]));
+                    window->surface.blend(int32_t(request.data[1]),
+                                          int32_t(request.data[2]), preparedText,
+                                          uint32_t(request.data[3]));
                 }
                 break;
-            case os::WindowRequest::Present:
+            case osgui::WindowRequest::Present:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
-                    markWindowDirtyLocked(*window);
+                    window->committed = window->surface;
+                    if (request.length == 5) {
+                        auto region = Geometry::intersection(
+                            {int32_t(request.data[1]), int32_t(request.data[2]),
+                             int32_t(request.data[3]), int32_t(request.data[4])},
+                            {0, 0, int32_t(window->surface.width()),
+                             int32_t(window->surface.height())});
+                        region.x += window->x;
+                        region.y += window->y;
+                        markDirtyLocked(region);
+                    } else
+                        markWindowDirtyLocked(*window);
                 }
                 break;
-            case os::WindowRequest::GetDisplayInfo:
+            case osgui::WindowRequest::GetDisplayInfo:
                 reply.data[1] = graphics_.display().info().width;
                 reply.data[2] = graphics_.display().info().height;
                 reply.data[3] = graphics_.display().info().bitsPerPixel;
@@ -569,35 +725,28 @@ class WindowServer {
                     static_cast<uint64_t>(graphics_.display().info().format);
                 reply.length = 5;
                 break;
-            case os::WindowRequest::SetSessionActive:
-                {
-                    os::TaskInfo caller{};
-                    if (os::Task::query(request.senderPid, caller) || caller.serviceRole != static_cast<uint32_t>(os::ServiceRole::Console)) {
-                        reply.data[0] = 1; break;
-                    }
-                }
-                if (!sessionActive_ && request.data[0] != 0) {
-                    sessionActive_ = true;
-                    markScreenDirtyLocked();
-                    nextFrameTime_ = 0;
-                } else if (request.data[0] == 0) {
-                    sessionActive_ = false;
-                }
-                break;
-            case os::WindowRequest::SetLayer:
+            case osgui::WindowRequest::SetLayer:
                 if (window == nullptr ||
                     request.data[1] >
-                        static_cast<uint64_t>(os::WindowLayer::Overlay)) {
+                        static_cast<uint64_t>(osgui::WindowLayer::Overlay)) {
                     reply.data[0] = 1;
                 } else {
                     markWindowDirtyLocked(*window);
-                    window->layer =
-                        static_cast<os::WindowLayer>(request.data[1]);
+                    window->layer = static_cast<osgui::WindowLayer>(request.data[1]);
                     window->zOrder = nextZOrder_++;
                     markWindowDirtyLocked(*window);
                 }
                 break;
-            case os::WindowRequest::Raise:
+            case osgui::WindowRequest::SetMovable:
+                if (!window || request.data[1] > 1)
+                    reply.data[0] = 1;
+                else {
+                    window->movable = request.data[1] != 0;
+                    if (!window->movable && capturedWindow_ == window->handle)
+                        capturedWindow_ = 0;
+                }
+                break;
+            case osgui::WindowRequest::Raise:
                 if (window == nullptr) {
                     reply.data[0] = 1;
                 } else {
@@ -615,11 +764,13 @@ class WindowServer {
     }
 
     void handleInput(const os::InputEvent& input) {
+        const auto received = os::Clock::getMonotonicTime();
         {
-            os::SpinLockGuard guard(lock_);
+            std::lock_guard<std::mutex> guard(lock_);
             if (!sessionActive_) {
                 return;
             }
+            if (!pendingInput_) pendingInput_ = received;
             Window* target = find(focusedWindow_);
             if (input.type == os::InputEventType::MouseMove) {
                 markCursorDirtyLocked(cursorX_, cursorY_);
@@ -627,13 +778,51 @@ class WindowServer {
                 cursorY_ += input.mouse.deltaY;
                 clampCursorLocked();
                 markCursorDirtyLocked(cursorX_, cursorY_);
+                if (Window* captured = find(capturedWindow_)) {
+                    if (captured->visible) {
+                        markWindowDirtyLocked(*captured);
+                        captured->x = cursorX_ - dragOffsetX_;
+                        captured->y = cursorY_ - dragOffsetY_;
+                        clampWindowLocked(*captured);
+                        markWindowDirtyLocked(*captured);
+                        return;
+                    }
+                    capturedWindow_ = 0;
+                } else
+                    capturedWindow_ = 0;
                 target = hitTestLocked(cursorX_, cursorY_);
             } else if (input.type == os::InputEventType::MouseButtonDown) {
                 Window* hit = hitTestLocked(cursorX_, cursorY_);
                 if (hit != nullptr) {
                     setFocusLocked(*hit);
                     target = hit;
+                    if ((input.mouse.buttons & 1U) &&
+                        hit->layer == osgui::WindowLayer::Normal && cursorY_ < hit->y &&
+                        cursorX_ >= hit->x + int32_t(hit->surface.width()) - 20) {
+                        if (hit->ownerPid) {
+                            osgui::WindowEvent close{};
+                            close.type = osgui::WindowEventType::WindowClose;
+                            close.timestamp = input.timestamp;
+                            hit->events.push(close);
+                            notifyEventWaiterLocked(*hit);
+                        } else {
+                            markWindowDirtyLocked(*hit);
+                            hit->visible = false;
+                        }
+                        return;
+                    }
+                    if ((input.mouse.buttons & 1U) && hit->movable &&
+                        hit->layer == osgui::WindowLayer::Normal && cursorY_ < hit->y) {
+                        capturedWindow_ = hit->handle;
+                        dragOffsetX_ = cursorX_ - hit->x;
+                        dragOffsetY_ = cursorY_ - hit->y;
+                        return;
+                    }
                 }
+            } else if (input.type == os::InputEventType::MouseButtonUp &&
+                       capturedWindow_) {
+                if (!(input.mouse.buttons & 1U)) capturedWindow_ = 0;
+                return;
             }
             if (target != nullptr && target->ownerPid == 0) {
                 bool changed = false;
@@ -641,14 +830,21 @@ class WindowServer {
                     const int32_t x = cursorX_ - target->x;
                     const int32_t y = cursorY_ - target->y;
                     if (input.type == os::InputEventType::MouseButtonDown) {
-                        changed = actionButton_.handlePointer(x, y, true) ||
-                                  inputBox_.handlePointer(x, y, true);
-                    } else if (input.type ==
-                               os::InputEventType::MouseButtonUp) {
+                        changed = actionButton_.handlePointer(x, y, true);
+                        changed = inputBox_.handlePointer(x, y, true) || changed;
+                    } else if (input.type == os::InputEventType::MouseButtonUp) {
+                        const bool activate = actionButton_.pressed() &&
+                                              actionButton_.contains(x, y);
                         changed = actionButton_.handlePointer(x, y, false);
+                        if (activate) {
+                            if (Window* status = find(systemWindowHandle_)) {
+                                status->visible = true;
+                                setFocusLocked(*status);
+                            }
+                        }
                     } else if (input.type == os::InputEventType::KeyDown) {
-                        changed = inputBox_.handleKey(input.key.keyCode,
-                                                      input.key.modifiers);
+                        changed =
+                            inputBox_.handleKey(input.key.keyCode, input.key.modifiers);
                     }
                     if (changed) {
                         renderDesktopWindowLocked(*target);
@@ -657,15 +853,15 @@ class WindowServer {
                 }
             }
             if (target != nullptr && target->ownerPid != 0) {
-                os::WindowEvent event{};
+                osgui::WindowEvent event{};
                 event.timestamp = input.timestamp;
-                event.x         = cursorX_ - target->x;
-                event.y         = cursorY_ - target->y;
-                event.buttons   = input.mouse.buttons;
-                event.delta     = input.mouse.wheel;
-                event.keyCode   = input.key.keyCode;
+                event.x = cursorX_ - target->x;
+                event.y = cursorY_ - target->y;
+                event.buttons = input.mouse.buttons;
+                event.delta = input.mouse.wheel;
+                event.keyCode = input.key.keyCode;
                 event.modifiers = input.key.modifiers;
-                event.type      = translateEventType(input.type);
+                event.type = translateEventType(input.type);
                 target->events.push(event);
                 notifyEventWaiterLocked(*target);
             }
@@ -673,70 +869,166 @@ class WindowServer {
     }
 
     void refresh() {
-        os::SpinLockGuard guard(lock_);
-        const uint64_t now = os::Clock::getMonotonicTime();
-        if (now >= nextClientSweep_) { reapClientsLocked(); nextClientSweep_ = now + 250000000; }
-        for (Window& window : windows_)
-            if (window.active) notifyEventWaiterLocked(window);
-        if (!sessionActive_ || !dirtyValid_) {
-            return;
+        profile_.wake();
+        const auto frameStart = os::Clock::getMonotonicTime();
+        profile_.report(frameStart, osgui::detail::Pixels::peakBytes());
+        std::lock_guard<std::mutex> displayGuard(displayLock_);
+        Window snapshot[windowCapacity];
+        osgui::detail::Damage damage;
+        int32_t x, y;
+        uint64_t focus, input = 0;
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            const uint64_t now = os::Clock::getMonotonicTime();
+            if (now >= nextClientSweep_) {
+                reapClientsLocked();
+                nextClientSweep_ = now + 250000000;
+            }
+            for (Window& window : windows_)
+                if (window.active) notifyEventWaiterLocked(window);
+            if (!sessionActive_ || !damage_.count || now < nextFrameTime_) return;
+            for (uint32_t i = 0; i < windowCapacity; ++i) {
+                snapshot[i] = windows_[i];
+                snapshot[i].surface = windows_[i].committed;
+            }
+            damage = damage_;
+            damage_.count = 0;
+            x = cursorX_;
+            y = cursorY_;
+            focus = focusedWindow_;
+            input = pendingInput_;
+            pendingInput_ = 0;
+            nextFrameTime_ = now + frameIntervalNanoseconds;
         }
-        if (now < nextFrameTime_) {
-            return;
+        for (uint32_t i = 0; i < damage.count; ++i)
+            graphics_.compose(snapshot, windowCapacity, x, y, focus, damage.regions[i]);
+        const auto completed = os::Clock::getMonotonicTime();
+        uint64_t area = 0;
+        for (uint32_t i = 0; i < damage.count; ++i)
+            area += uint64_t(damage.regions[i].width) * damage.regions[i].height;
+        profile_.frame(completed - frameStart,
+                       input && completed >= input ? completed - input : 0, 0, area,
+                       area * (graphics_.display().info().bitsPerPixel / 8));
+    }
+    void waitForDamage() {
+        uint64_t deadline;
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            deadline = nextClientSweep_;
+            if (sessionActive_ && damage_.count && nextFrameTime_ < deadline)
+                deadline = nextFrameTime_;
         }
-        composeDirtyLocked();
-        nextFrameTime_ = now + frameIntervalNanoseconds;
+        os::IpcMessage event{};
+        os::receiveMessage(damageEndpoint_, event, deadline);
+    }
+    void cancelInput() {
+        std::lock_guard<std::mutex> guard(lock_);
+        capturedWindow_ = 0;
     }
 
    private:
     void reapClientsLocked() {
-        for (auto& window : windows_) if (window.active && window.ownerPid) {
-            os::TaskInfo owner{};
-            if (!os::Task::query(window.ownerPid, owner) && owner.state != 2) continue;
-            markWindowDirtyLocked(window);
-            if (window.eventEndpoint) os::closeHandle(window.eventEndpoint);
-            window.eventEndpoint = 0; window.eventWaiting = false;
-            window.active = window.visible = false; window.events.clear();
-            if (focusedWindow_ == window.handle) focusedWindow_ = 0;
+        for (auto& window : windows_)
+            if (window.active && window.ownerPid) {
+                os::TaskInfo owner{};
+                if (!os::Task::query(window.ownerPid, owner) && owner.state != 2)
+                    continue;
+                markWindowDirtyLocked(window);
+                if (window.eventEndpoint) os::closeHandle(window.eventEndpoint);
+                window.eventEndpoint = 0;
+                window.eventWaiting = false;
+                if (capturedWindow_ == window.handle) capturedWindow_ = 0;
+                window.active = window.visible = false;
+                window.events.clear();
+                window.surface = Surface{};
+                window.committed = Surface{};
+                window.titleMask = Surface{};
+                if (focusedWindow_ == window.handle) focusedWindow_ = 0;
+            }
+    }
+    void handleBatch(const os::IpcMessage& request, os::IpcMessage& reply) {
+        reply.length = 1;
+        reply.data[0] = 1;
+        if (request.length != 1 + (sizeof(osgui::DrawBatch) + 7) / 8) return;
+        osgui::DrawBatch batch;
+        memcpy(&batch, &request.data[1], sizeof(batch));
+        if (!osgui::detail::validBatch(batch)) return;
+        osgui::TextBitmap text[osgui::batchCommandCapacity];
+        for (uint32_t i = 0; i < batch.count; ++i) {
+            const auto& command = batch.commands[i];
+            if (command.kind == osgui::DrawKind::Text &&
+                !osgui::Font::render(batch.text + command.offset, command.length,
+                                     osgui::FontFace(command.fontFace),
+                                     command.fontSize, text[i]))
+                return;
         }
+        std::lock_guard<std::mutex> guard(lock_);
+        Window* window = findOwned(request.senderPid, request.data[0]);
+        if (!window) return;
+        Surface& next = window->surface;
+        if (!next.prepare()) return;
+        for (uint32_t i = 0; i < batch.count; ++i) {
+            const auto& command = batch.commands[i];
+            uint32_t width = command.width, height = command.height;
+            if (command.kind == osgui::DrawKind::Fill)
+                next.fillRectangle(command.x, command.y, width, height, command.color);
+            else {
+                next.blend(command.x, command.y, text[i], command.color);
+                width = text[i].width;
+                height = text[i].height;
+            }
+            window->pendingDamage.add(
+                {command.x, command.y, int32_t(width), int32_t(height)},
+                {0, 0, int32_t(next.width()), int32_t(next.height())});
+        }
+        window->surface = next;
+        if (batch.present) {
+            window->committed = next;
+            if (window->visible)
+                for (uint32_t i = 0; i < window->pendingDamage.count; ++i) {
+                    auto region = window->pendingDamage.regions[i];
+                    region.x += window->x;
+                    region.y += window->y;
+                    markDirtyLocked(region);
+                }
+            window->pendingDamage.count = 0;
+        }
+        reply.data[0] = 0;
     }
     void initializeDesktopLocked() {
-        initializeSystemWindow(windows_[0], 80, 105, 360, 220,
-                               "Welcome to osinfo");
+        initializeSystemWindow(windows_[0], 80, 105, 360, 220, "Welcome to osinfo");
         welcomeWindowHandle_ = windows_[0].handle;
-        welcomeLabel_.init({20, 20, 280, 20}, "OSINFO DESKTOP",
-                                 0x0021262cU);
+        welcomeLabel_.init({20, 20, 280, 20}, "OSINFO DESKTOP", 0x0021262cU);
         inputBox_.init({20, 70, 300, 36}, "Type here");
         actionButton_.init({20, 132, 132, 38}, "OPEN");
 
-        initializeSystemWindow(windows_[1], 485, 175, 260, 160,
-                               "System status");
+        initializeSystemWindow(windows_[1], 485, 175, 260, 160, "System status");
         systemWindowHandle_ = windows_[1].handle;
-        systemLabel_.init({18, 22, 220, 20}, "SYSTEM ONLINE",
-                                0x0021262cU);
-        detailLabel_.init({18, 58, 220, 20}, "4 CPU  64-BIT",
-                                0x00545c66U);
+        systemLabel_.init({18, 22, 220, 20}, "SYSTEM ONLINE", 0x0021262cU);
+        detailLabel_.init({18, 58, 220, 20}, "4 CPU  64-BIT", 0x00545c66U);
         renderDesktopWindowLocked(windows_[0]);
         renderDesktopWindowLocked(windows_[1]);
         focusedWindow_ = welcomeWindowHandle_;
     }
 
-    void initializeSystemWindow(Window& window, int32_t x, int32_t y,
-                                uint32_t width, uint32_t height,
-                                const char* title) {
+    void initializeSystemWindow(Window& window, int32_t x, int32_t y, uint32_t width,
+                                uint32_t height, const char* title) {
         window.surface.resize(width, height);
-        window.active        = true;
-        window.visible       = true;
-        window.layer         = os::WindowLayer::Normal;
-        window.zOrder        = nextZOrder_++;
-        window.handle        = nextHandle_++;
-        window.ownerPid      = 0;
+        window.active = true;
+        window.visible = true;
+        window.layer = osgui::WindowLayer::Normal;
+        window.zOrder = nextZOrder_++;
+        window.handle = nextHandle_++;
+        window.ownerPid = 0;
         window.eventEndpoint = 0;
-        window.eventWaiting  = false;
-        window.x             = x;
-        window.y             = y;
+        window.eventWaiting = false;
+        window.x = x;
+        window.y = y;
         window.events.clear();
         os::Runtime::copyString(window.title, title, sizeof(window.title));
+        osgui::TextBitmap bitmap;
+        if (osgui::Font::render(title, strlen(title), osgui::FontFace::Ui, 16, bitmap))
+            window.titleMask.mask(bitmap);
         clampWindowLocked(window);
     }
 
@@ -753,31 +1045,36 @@ class WindowServer {
             window.surface.fillRectangle(18, 98, 190, 8, 0x00d9dfe3U);
             window.surface.fillRectangle(18, 98, 138, 8, 0x002b8a65U);
         }
+        window.committed = window.surface;
     }
 
-    void create(const os::IpcMessage& request, os::IpcMessage& reply) {
+    void create(const os::IpcMessage& request, os::IpcMessage& reply,
+                const Surface& title) {
         reapClientsLocked();
-        const uint32_t width  = static_cast<uint32_t>(request.data[0]);
+        const uint32_t width = static_cast<uint32_t>(request.data[0]);
         const uint32_t height = static_cast<uint32_t>(request.data[1]);
         for (uint32_t index = 0; index < windowCapacity; ++index) {
             Window& window = windows_[index];
             if (!window.active && window.surface.resize(width, height)) {
-                window.active        = true;
-                window.visible       = false;
-                window.layer         = os::WindowLayer::Normal;
-                window.zOrder        = nextZOrder_++;
-                window.handle        = nextHandle_++;
-                window.ownerPid      = request.senderPid;
+                window.titleMask = title;
+                window.pendingDamage.count = 0;
+                window.committed = window.surface;
+                window.active = true;
+                window.visible = false;
+                window.layer = osgui::WindowLayer::Normal;
+                window.zOrder = nextZOrder_++;
+                window.handle = nextHandle_++;
+                window.ownerPid = request.senderPid;
                 window.eventEndpoint = 0;
-                window.eventWaiting  = false;
-                window.x             = 40 + static_cast<int32_t>(index * 28);
-                window.y             = 70 + static_cast<int32_t>(index * 24);
+                window.eventWaiting = false;
+                window.x = 40 + static_cast<int32_t>(index * 28);
+                window.y = 70 + static_cast<int32_t>(index * 24);
                 window.events.clear();
                 os::Runtime::copyString(window.title,
-                               reinterpret_cast<const char*>(&request.data[2]),
-                               sizeof(window.title));
+                                        reinterpret_cast<const char*>(&request.data[2]),
+                                        sizeof(window.title));
                 reply.data[1] = window.handle;
-                reply.length  = 2;
+                reply.length = 2;
                 return;
             }
         }
@@ -785,23 +1082,23 @@ class WindowServer {
     }
 
     void getEvent(uint64_t ownerPid, uint64_t handle, os::IpcMessage& reply) {
-        os::WindowEvent event{};
-        os::SpinLockGuard guard(lock_);
+        osgui::WindowEvent event{};
+        std::lock_guard<std::mutex> guard(lock_);
         Window* window = findOwned(ownerPid, handle);
         if (window == nullptr || window->eventEndpoint == 0) {
             reply.data[0] = 1;
-            reply.length  = 1;
+            reply.length = 1;
             return;
         }
         if (!window->events.pop(event)) {
             window->eventWaiting = true;
-            reply.data[0]        = static_cast<uint64_t>(
-                static_cast<int64_t>(os::ErrorCode::WouldBlock));
+            reply.data[0] =
+                static_cast<uint64_t>(static_cast<int64_t>(os::ErrorCode::WouldBlock));
             reply.length = 1;
             return;
         }
         window->eventWaiting = false;
-        reply.data[0]         = 0;
+        reply.data[0] = 0;
         const uint8_t* source = reinterpret_cast<const uint8_t*>(&event);
         for (uint32_t index = 0; index < sizeof(event); ++index) {
             reinterpret_cast<uint8_t*>(&reply.data[1])[index] = source[index];
@@ -810,33 +1107,35 @@ class WindowServer {
     }
 
     void subscribeEvents(const os::IpcMessage& request, os::IpcMessage& reply) {
-        os::SpinLockGuard guard(lock_);
+        std::lock_guard<std::mutex> guard(lock_);
         Window* window = findOwned(request.senderPid, request.data[0]);
         if (window == nullptr || request.handleCount != 1) {
             for (uint32_t index = 0; index < request.handleCount; ++index) {
                 os::closeHandle(request.handles[index]);
             }
             reply.data[0] = 1;
-            reply.length  = 1;
+            reply.length = 1;
             return;
         }
         if (window->eventEndpoint != 0) {
             os::closeHandle(window->eventEndpoint);
         }
         window->eventEndpoint = request.handles[0];
-        window->eventWaiting  = false;
-        reply.data[0]         = 0;
-        reply.length          = 1;
+        window->eventWaiting = false;
+        reply.data[0] = 0;
+        reply.length = 1;
     }
 
     void notifyEventWaiterLocked(Window& window) {
-        if (!window.eventWaiting || window.eventEndpoint == 0 || window.events.empty()) return;
+        if (!window.eventWaiting || window.eventEndpoint == 0 || window.events.empty())
+            return;
         os::IpcMessage notification{};
-        notification.type = os::windowEventNotification;
+        notification.type = osgui::windowEventNotification;
         // Input, compositor and request processing share this lock. A client
         // that stops draining its endpoint must never block all three threads.
         const int status = os::sendMessage(window.eventEndpoint, notification, 0);
-        if (status == 0) window.eventWaiting = false;
+        if (status == 0)
+            window.eventWaiting = false;
         else if (status != static_cast<int>(os::ErrorCode::WouldBlock) &&
                  status != static_cast<int>(os::ErrorCode::Timeout) &&
                  status != static_cast<int>(os::ErrorCode::Interrupted)) {
@@ -858,12 +1157,11 @@ class WindowServer {
 
     Window* findOwned(uint64_t ownerPid, uint64_t handle) {
         Window* window = find(handle);
-        return window != nullptr && window->ownerPid == ownerPid ? window
-                                                                 : nullptr;
+        return window != nullptr && window->ownerPid == ownerPid ? window : nullptr;
     }
 
     Window* hitTestLocked(int32_t x, int32_t y) {
-        Window* result     = nullptr;
+        Window* result = nullptr;
         uint64_t resultKey = 0;
         for (uint32_t index = 0; index < windowCapacity; ++index) {
             Window& window = windows_[index];
@@ -874,7 +1172,7 @@ class WindowServer {
                 const uint64_t key =
                     (static_cast<uint64_t>(window.layer) << 56) | window.zOrder;
                 if (result == nullptr || key > resultKey) {
-                    result    = &window;
+                    result = &window;
                     resultKey = key;
                 }
             }
@@ -893,10 +1191,10 @@ class WindowServer {
             markWindowDirtyLocked(*previous);
         }
         focusedWindow_ = window.handle;
-        window.zOrder  = nextZOrder_++;
+        window.zOrder = nextZOrder_++;
         markWindowDirtyLocked(window);
-        os::WindowEvent event{};
-        event.type      = os::WindowEventType::WindowFocus;
+        osgui::WindowEvent event{};
+        event.type = osgui::WindowEventType::WindowFocus;
         event.timestamp = os::Clock::getMonotonicTime();
         window.events.push(event);
         notifyEventWaiterLocked(window);
@@ -914,42 +1212,41 @@ class WindowServer {
     }
 
     void clampWindowLocked(Window& window) {
-        const int32_t maximumX = static_cast<int32_t>(
-            graphics_.display().info().width - window.surface.width());
-        const int32_t maximumY = static_cast<int32_t>(
-            graphics_.display().info().height - window.surface.height());
-        if (window.x < 0) window.x = 0;
-        if (window.y < static_cast<int32_t>(titleBarHeight)) {
-            window.y = titleBarHeight;
-        }
+        const int32_t screenWidth = int32_t(graphics_.display().info().width);
+        const int32_t screenHeight = int32_t(graphics_.display().info().height);
+        const int32_t minimumX = 32 - int32_t(window.surface.width());
+        const int32_t maximumX = screenWidth - 32;
+        const int32_t maximumY =
+            screenHeight > int32_t(titleBarHeight) ? screenHeight : titleBarHeight;
+        if (window.x < minimumX) window.x = minimumX;
         if (window.x > maximumX) window.x = maximumX;
+        if (window.y < int32_t(titleBarHeight)) window.y = titleBarHeight;
         if (window.y > maximumY) window.y = maximumY;
     }
 
-    static os::WindowEventType translateEventType(os::InputEventType type) {
+    static osgui::WindowEventType translateEventType(os::InputEventType type) {
         switch (type) {
             case os::InputEventType::KeyDown:
-                return os::WindowEventType::KeyDown;
+                return osgui::WindowEventType::KeyDown;
             case os::InputEventType::KeyUp:
-                return os::WindowEventType::KeyUp;
+                return osgui::WindowEventType::KeyUp;
             case os::InputEventType::MouseMove:
-                return os::WindowEventType::MouseMove;
+                return osgui::WindowEventType::MouseMove;
             case os::InputEventType::MouseButtonDown:
-                return os::WindowEventType::MouseButtonDown;
+                return osgui::WindowEventType::MouseButtonDown;
             case os::InputEventType::MouseButtonUp:
-                return os::WindowEventType::MouseButtonUp;
+                return osgui::WindowEventType::MouseButtonUp;
             case os::InputEventType::MouseWheel:
-                return os::WindowEventType::MouseWheel;
+                return osgui::WindowEventType::MouseWheel;
             default:
-                return os::WindowEventType::None;
+                return osgui::WindowEventType::None;
         }
     }
 
     Rectangle windowBounds(const Window& window) const {
-        return {
-            window.x - 2, window.y - static_cast<int32_t>(titleBarHeight) - 2,
-            static_cast<int32_t>(window.surface.width()) + 4,
-            static_cast<int32_t>(window.surface.height() + titleBarHeight) + 4};
+        return {window.x - 2, window.y - static_cast<int32_t>(titleBarHeight) - 2,
+                static_cast<int32_t>(window.surface.width()) + 4,
+                static_cast<int32_t>(window.surface.height() + titleBarHeight) + 4};
     }
 
     void markWindowDirtyLocked(const Window& window) {
@@ -963,137 +1260,127 @@ class WindowServer {
     }
 
     void markScreenDirtyLocked() {
-        markDirtyLocked(
-            {0, 0, static_cast<int32_t>(graphics_.display().info().width),
-             static_cast<int32_t>(graphics_.display().info().height)});
+        markDirtyLocked({0, 0, static_cast<int32_t>(graphics_.display().info().width),
+                         static_cast<int32_t>(graphics_.display().info().height)});
     }
 
     void markDirtyLocked(const Rectangle& rectangle) {
-        const Rectangle screen = {
-            0, 0, static_cast<int32_t>(graphics_.display().info().width),
-            static_cast<int32_t>(graphics_.display().info().height)};
-        const Rectangle clipped = Geometry::intersection(rectangle, screen);
-        if (clipped.width <= 0 || clipped.height <= 0) {
-            return;
+        const bool empty = damage_.count == 0;
+        damage_.add(rectangle, {0, 0, int32_t(graphics_.display().info().width),
+                                int32_t(graphics_.display().info().height)});
+        if (empty && damage_.count) {
+            os::IpcMessage event{};
+            os::sendMessage(damageEndpoint_, event, 0);
         }
-        if (!dirtyValid_) {
-            dirty_      = clipped;
-            dirtyValid_ = true;
-            return;
-        }
-        const int32_t left = dirty_.x < clipped.x ? dirty_.x : clipped.x;
-        const int32_t top  = dirty_.y < clipped.y ? dirty_.y : clipped.y;
-        const int32_t right =
-            dirty_.x + dirty_.width > clipped.x + clipped.width
-                ? dirty_.x + dirty_.width
-                : clipped.x + clipped.width;
-        const int32_t bottom =
-            dirty_.y + dirty_.height > clipped.y + clipped.height
-                ? dirty_.y + dirty_.height
-                : clipped.y + clipped.height;
-        dirty_ = {left, top, right - left, bottom - top};
-    }
-
-    void composeDirtyLocked() {
-        if (!dirtyValid_) {
-            return;
-        }
-        graphics_.compose(windows_, windowCapacity, cursorX_, cursorY_,
-                          focusedWindow_, dirty_);
-        dirtyValid_ = false;
     }
 
     GraphicsServer graphics_;
     Window windows_[windowCapacity]{};
-    os::SpinLock lock_;
-    uint64_t nextHandle_    = 1;
+    osgui::detail::Profile profile_;
+    uint64_t pendingInput_ = 0;
+    std::mutex lock_;
+    std::mutex displayLock_;
+    uint64_t damageEndpoint_ = 0;
+    char clipboard_[osgui::clipboardCapacity]{};
+    uint32_t clipboardLength_ = 0;
+    uint64_t nextHandle_ = 1;
     uint64_t focusedWindow_ = 0;
-    uint64_t nextZOrder_    = 1;
+    uint64_t nextZOrder_ = 1;
     uint64_t nextFrameTime_ = 0;
     uint64_t nextClientSweep_ = 0;
-    int32_t cursorX_        = 0;
-    int32_t cursorY_        = 0;
-    Rectangle dirty_{};
-    bool dirtyValid_              = false;
-    bool sessionActive_           = false;
+    int32_t cursorX_ = 0;
+    int32_t cursorY_ = 0;
+    osgui::detail::Damage damage_;
+    uint64_t capturedWindow_ = 0;
+    int32_t dragOffsetX_ = 0, dragOffsetY_ = 0;
+    bool sessionActive_ = false;
     uint64_t welcomeWindowHandle_ = 0;
-    uint64_t systemWindowHandle_  = 0;
-    window::Label welcomeLabel_;
-    window::Label systemLabel_;
-    window::Label detailLabel_;
-    window::Button actionButton_;
-    window::TextBox inputBox_;
+    uint64_t systemWindowHandle_ = 0;
+    osgui::widgets::Label welcomeLabel_;
+    osgui::widgets::Label systemLabel_;
+    osgui::widgets::Label detailLabel_;
+    osgui::widgets::Button actionButton_;
+    osgui::widgets::TextBox inputBox_;
 };
 
 class WindowApplication {
- public:
-    static void inputMain(void* self) { static_cast<WindowApplication*>(self)->inputLoop(); }
-    static void compositorMain(void* self) { static_cast<WindowApplication*>(self)->compositorLoop(); }
-WindowServer windowServer;
-uint64_t registryEndpoint;
-
-void inputLoop() {
-    const uint64_t input =
-        os::ServiceRegistry::lookupService(registryEndpoint, os::inputServiceName, 5000);
-    os::InputClient client;
-    if (!client.connect(input)) {
-        os::System::log("[GUIW] input service unavailable\n");
-        return;
+   public:
+    static void inputMain(void* self) {
+        static_cast<WindowApplication*>(self)->inputLoop();
     }
-    while (true) {
-        if (!client.wait()) {
-            os::System::log("[GUIW] input subscription failed\n");
+    static void compositorMain(void* self) {
+        static_cast<WindowApplication*>(self)->compositorLoop();
+    }
+    WindowServer windowServer;
+    uint64_t registryEndpoint;
+
+    void inputLoop() {
+        const uint64_t input = os::ServiceRegistry::lookupService(
+            registryEndpoint, os::inputServiceName, 5000);
+        os::InputClient client;
+        if (!client.connect(input)) {
+            os::System::log("[GUIW] input service unavailable\n");
             return;
         }
-        os::InputEvent event{};
-        while (client.receive(event)) {
-            windowServer.handleInput(event);
+        while (true) {
+            if (!client.wait()) {
+                windowServer.cancelInput();
+                os::System::log("[GUIW] input subscription failed\n");
+                return;
+            }
+            os::InputEvent event{};
+            while (client.receive(event)) {
+                windowServer.handleInput(event);
+            }
         }
     }
-}
 
-void compositorLoop() {
-    while (true) {
-        windowServer.refresh();
-        os::sleep(1);
-    }
-}
-
-
-int run() {
-    os::System::log("[GUIW] Window Server started in Ring 3\n");
-    registryEndpoint        = os::getBootstrapHandle();
-    const uint64_t endpoint = os::Endpoint::create();
-    if (registryEndpoint == 0 || endpoint == 0 || !windowServer.init() ||
-        !os::ServiceRegistry::registerService(registryEndpoint, os::guiwServiceName,
-                             endpoint)) {
-        os::System::log("[GUIW] display or service initialization failed\n");
-        return 1;
-    }
-    constexpr uint64_t inputStackAddress = 0x0000000061000000ULL;
-    if (os::mapMemory(inputStackAddress, serviceThreadStackSize, 1) !=
-            inputStackAddress ||
-        os::mapMemory(compositorStackAddress, serviceThreadStackSize, 1) !=
-            compositorStackAddress ||
-        os::createThread(inputMain,
-                         inputStackAddress + serviceThreadStackSize, this) == 0 ||
-        os::createThread(compositorMain, compositorStackAddress +
-                                             serviceThreadStackSize, this) == 0) {
-        os::System::log("[GUIW] unable to start input or compositor thread\n");
-        return 2;
-    }
-    os::System::log("[GRAPHICS] linear framebuffer and software compositor online\n");
-    os::System::log("[GUIW] layered 60 Hz compositor and input dispatch online\n");
-    while (true) {
-        os::IpcMessage request{};
-        if (os::receiveMessage(endpoint, request) != 0) {
-            continue;
+    void compositorLoop() {
+        while (true) {
+            windowServer.refresh();
+            windowServer.waitForDamage();
         }
-        os::IpcMessage reply{};
-        windowServer.handle(request, reply);
-        os::replyMessage(endpoint, request.replyToken, reply);
     }
-}
+
+    int run() {
+        os::System::log("[GUIW] Window Server started in Ring 3\n");
+        registryEndpoint = os::getBootstrapHandle();
+        const uint64_t endpoint = os::Endpoint::create();
+        if (registryEndpoint == 0 || endpoint == 0 || !windowServer.init() ||
+            !os::ServiceRegistry::registerService(registryEndpoint,
+                                                  osgui::guiwServiceName, endpoint)) {
+            os::System::log("[GUIW] display or service initialization failed\n");
+            return 1;
+        }
+        constexpr uint64_t inputStackAddress = 0x0000000061000000ULL;
+        if (os::mapMemory(inputStackAddress, serviceThreadStackSize, 1) !=
+                inputStackAddress ||
+            os::mapMemory(compositorStackAddress, serviceThreadStackSize, 1) !=
+                compositorStackAddress ||
+            os::createThread(inputMain, inputStackAddress + serviceThreadStackSize,
+                             this) == 0 ||
+            os::createThread(compositorMain,
+                             compositorStackAddress + serviceThreadStackSize,
+                             this) == 0) {
+            os::System::log("[GUIW] unable to start input or compositor thread\n");
+            return 2;
+        }
+        os::System::log(
+            "[GRAPHICS] linear framebuffer and software compositor online\n");
+        os::System::log("[GUIW] layered 60 Hz compositor and input dispatch online\n");
+        while (true) {
+            os::IpcMessage request{};
+            if (os::receiveMessage(endpoint, request) != 0) {
+                continue;
+            }
+            os::IpcMessage reply{};
+            windowServer.handle(request, reply);
+            os::replyMessage(endpoint, request.replyToken, reply);
+        }
+    }
 };
 }  // namespace
-int main(int, char**) { static WindowApplication application; return application.run(); }
+int main(int, char**) {
+    static WindowApplication application;
+    return application.run();
+}

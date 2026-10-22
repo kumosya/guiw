@@ -1,0 +1,73 @@
+{
+  "version": "0.2.0",
+  "cppflags": [
+    "-Iinclude",
+    "-nostdinc",
+    "-ffreestanding",
+    "-fno-builtin",
+    "-fno-stack-protector",
+    "-fPIC",
+    "-m64",
+    "-mcmodel=small",
+    "-mno-red-zone"
+  ],
+  "cflags": [
+    "-std=c17",
+    "-Os",
+    "-Wall",
+    "-Wextra"
+  ],
+  "cxxflags": [
+    "-std=c++20",
+    "-fno-exceptions",
+    "-fno-rtti",
+    "-fno-use-cxa-atexit",
+    "-fno-threadsafe-statics",
+    "-nostdinc++",
+    "-Os",
+    "-Wall",
+    "-Wextra"
+  ],
+  "ldflags": [
+    "-nostdlib",
+    "-nostartfiles",
+    "-nodefaultlibs",
+    "-Wl,--build-id=none,--hash-style=sysv",
+    "-Wl,--no-as-needed"
+  ],
+  "asflags": [],
+  "ldlibs": [
+    "gcc"
+  ],
+  "name": "libosgui-c++",
+  "include_dirs": [
+    "include"
+  ],
+  "targets": [
+    {
+      "name": "libosgui-c++.so",
+      "kind": "shared",
+      "sources": [
+        "src/*.cc"
+      ],
+      "libraries": [
+        "c++",
+        "c",
+        "os-c++"
+      ]
+    }
+  ],
+  "install": {
+    "libosgui-c++.so": "/usr/lib/libosgui-c++.so",
+    "include/osgui/gui.h": "/usr/include/osgui-c++/osgui/gui.h",
+    "include/osgui/protocol.h": "/usr/include/osgui-c++/osgui/protocol.h",
+    "include/osgui/session.h": "/usr/include/osgui-c++/osgui/session.h",
+    "include/osgui/font.h": "/usr/include/osgui-c++/osgui/font.h",
+    "assets/fonts/ui.ttf": "/usr/share/fonts/osinfo/ui.ttf",
+    "assets/fonts/mono.ttf": "/usr/share/fonts/osinfo/mono.ttf",
+    "assets/fonts/fallback.ttf": "/usr/share/fonts/osinfo/fallback.ttf",
+    "assets/fonts/LICENSE": "/usr/share/fonts/osinfo/LICENSE",
+    "vendor/LICENSE": "/usr/share/licenses/libosgui-c++/stb-LICENSE",
+    "LICENSE": "/usr/share/licenses/libosgui-c++/LICENSE"
+  }
+}

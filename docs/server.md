@@ -1,6 +1,6 @@
 # GUI Window 服务
 
-GUI Window 服务（注册名 `"guiw"`）是窗口服务器/合成器：软件合成、窗口管理、输入分发与内置桌面演示控件。它与 `/usr/bin/terminal` 一同由 guiw 软件包交付，程序本体安装在 `/sbin/sys/guiw.elf`，授予 `taskCapabilityDisplay`。
+GUI Window 服务（注册名 `"guiw"`）是窗口服务器/合成器：软件合成、窗口管理、输入分发与内置桌面演示控件。程序由 `guiw` 包安装到 `/sbin/sys/guiw.elf`，授予 `taskCapabilityDisplay`；`/usr/bin/terminal` 由独立的 `guiw-app-tools` 包提供。启动 GUI 会话的镜像需要同时安装配套运行库、服务器和 tools 包。
 
 ## 1. 常量
 

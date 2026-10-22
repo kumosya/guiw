@@ -4,7 +4,7 @@
 
 #include "os/input.h"
 
-namespace window {
+namespace osgui::widgets {
 
 struct WidgetBounds {
     int32_t x;
@@ -15,10 +15,9 @@ struct WidgetBounds {
 
 class WidgetCanvas {
    public:
-    virtual void fillRectangle(int32_t x, int32_t y, uint32_t width,
-                               uint32_t height, uint32_t color) = 0;
-    virtual void drawText(int32_t x, int32_t y, const char* text,
-                          uint32_t color) = 0;
+    virtual void fillRectangle(int32_t x, int32_t y, uint32_t width, uint32_t height,
+                               uint32_t color) = 0;
+    virtual void drawText(int32_t x, int32_t y, const char* text, uint32_t color) = 0;
 };
 
 class Widget {
@@ -35,8 +34,7 @@ class Widget {
 
 class Label final : public Widget {
    public:
-    void init(const WidgetBounds& bounds, const char* text,
-                    uint32_t color);
+    void init(const WidgetBounds& bounds, const char* text, uint32_t color);
     void render(WidgetCanvas& canvas) const override;
 
    private:
@@ -71,4 +69,4 @@ class TextBox final : public Widget {
     bool focused_ = false;
 };
 
-}  // namespace window
+}  // namespace osgui::widgets

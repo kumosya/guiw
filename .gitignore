@@ -69,6 +69,8 @@ Testing/
 .cache/
 
 /infoide
+__pycache__/
+*.pyc
 
 /*.img
 /*.iso
